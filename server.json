@@ -1,0 +1,18 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.pipeworx-io/germany-tenders",
+  "title": "Germany Tenders",
+  "description": "Germany public procurement MCP — official German government tenders (keyless).",
+  "version": "0.1.0",
+  "websiteUrl": "https://pipeworx.io/packs/germany-tenders",
+  "repository": {
+    "url": "https://github.com/pipeworx-io/mcp-germany-tenders",
+    "source": "github"
+  },
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://gateway.pipeworx.io/germany-tenders/mcp"
+    }
+  ]
+}

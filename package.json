@@ -1,0 +1,20 @@
+{
+  "name": "@pipeworx/mcp-germany-tenders",
+  "version": "0.1.0",
+  "description": "Germany public procurement MCP — official German government tenders (keyless).",
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "keywords": ["mcp", "mcp-server", "model-context-protocol", "pipeworx", "germany-tenders"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/pipeworx-io/mcp-germany-tenders"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0"
+  }
+}
