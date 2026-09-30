@@ -762,18 +762,26 @@ function collapse(s: string): string {
  *
  * Wraps the "Datenservice Öffentliche Beschaffung" open-data feed published by
  * the German federal Bekanntmachungsservice at https://oeffentlichevergabe.de.
- * The feed is Open Contracting Data Standard (OCDS), CC0-licensed, publisher
- * scheme `ocds-mnwr74`.
+ * The feed is Open Contracting Data Standard (OCDS) — every release package
+ * the API returns carries "license": "https://opendefinition.org/licenses/cc-zero/"
+ * (CC0) in its own metadata, publisher scheme `ocds-mnwr74`.
  *
  * The ONLY endpoint the service exposes is a bulk export:
  *   GET /api/notice-exports?pubDay=YYYY-MM-DD&format=ocds.zip
  *   GET /api/notice-exports?pubMonth=YYYY-MM&format=ocds.zip
  * It returns a ZIP archive containing one OCDS release-package JSON per notice
- * (there is no server-side keyword/value search). This pack fetches the daily
- * ZIP(s) for the requested date range, unzips them in-memory (Workers-native
- * DecompressionStream, no deps), and applies keyword/date filtering + shaping
- * client-side. To keep latency and payload bounded, a date range is capped to a
- * small number of days per call.
+ * (there is no server-side keyword/value search).
+ *
+ * Internal architecture notes (engineering only — never put this in a
+ * caller-visible string; run scripts/check-hosting-claims.mjs before editing
+ * any tool description, error, note, or hint in this file): fleet #2513 /
+ * migration 225 cut per-call latency by pre-computing most of the answer
+ * ahead of a request instead of doing all the work inside it — see
+ * docs/flat-file-demand-wave-2026-09-29.md for the design. If that
+ * pre-computed path is unavailable for some reason, germany_search_tenders
+ * degrades to doing the work inline, unchanged from before. The two history
+ * tools need the pre-computed path (there is no per-request equivalent for
+ * an aggregate across months of data).
  *
  * All tools return shaped, LLM-friendly objects (not raw OCDS passthrough) and
  * never throw — fetch/parse failures resolve to { error }.
@@ -790,23 +798,27 @@ async function pwFetch(url: string | URL, init?: RequestInit): Promise<Response>
 
 const BASE = 'https://oeffentlichevergabe.de';
 const UA = 'pipeworx/1.0 (+https://pipeworx.io)';
-// Cap how many daily ZIPs we fetch per call — each ZIP is ~1-3MB / ~50 notices.
+const SOURCE_ID = 'germany_oeffentlichevergabe';
+// Cap how many daily ZIPs we fetch LIVE per call (for days the store does not
+// cover) — each ZIP is ~1-3MB / tens-to-low-hundreds of notices.
 // 3 days × ~4s per fetch ≈ 12s, safely within the 28s gateway deadline.
 // The old value of 7 caused persistent 28s timeouts on ask_pipeworx (fleet #xxx).
-const MAX_DAYS = 3;
-const DEFAULT_DAYS = 30; // default lookback window (clamped to MAX_DAYS of fetches, most-recent-first)
+// Once the store covers a range there is no per-call day cap at all — see
+// searchTenders below.
+const MAX_LIVE_DAYS = 3;
+const DEFAULT_DAYS = 30; // default lookback window when no dates given
 
 const tools: McpToolExport['tools'] = [
   {
     name: 'germany_search_tenders',
     description:
-      'Search official GERMAN government public-procurement tenders (Öffentliche Vergabe / Ausschreibungen) from the federal Bekanntmachungsservice open-data feed (oeffentlichevergabe.de), Open Contracting Data Standard (OCDS). Returns each notice shaped: ocid, title, buyer/Vergabestelle, contract value in EUR, procurement category, CPV code, procurement method, submission deadline, and publish date. Filter by publish-date range and/or a keyword (matched against title, description, buyer, and CPV description — German text). Defaults to the most recent days if no dates given. Data covers Germany only.',
+      'Search official GERMAN government public-procurement tenders (Öffentliche Vergabe / Ausschreibungen) from the federal Bekanntmachungsservice open-data feed (oeffentlichevergabe.de), Open Contracting Data Standard (OCDS, CC0). Returns each notice shaped: ocid, title, buyer/Vergabestelle, contract value in EUR, procurement category, CPV code, procurement method, submission deadline, and publish date. Filter by publish-date range and/or a keyword (matched against title, description, buyer, and CPV description — German text). Defaults to the most recent days if no dates given. Can answer wide date ranges (months) as well as very recent days. Data covers Germany only.',
     inputSchema: {
       type: 'object',
       properties: {
         date_from: {
           type: 'string',
-          description: 'Earliest PUBLISH date to include, YYYY-MM-DD. Defaults to ~30 days ago (only the most recent 3 days of that window are fetched per call — narrow the range for older notices).',
+          description: 'Earliest PUBLISH date to include, YYYY-MM-DD. Defaults to ~30 days ago. A very old date may only partly be covered; see the response for how much of the range came back.',
         },
         date_to: {
           type: 'string',
@@ -823,13 +835,48 @@ const tools: McpToolExport['tools'] = [
       },
     },
   },
+  {
+    name: 'germany_buyer_spend_history',
+    description:
+      'Procurement spend history for a GERMAN government buyer (Vergabestelle) — e.g. a city, a ministry, a university hospital — across German OCDS tender notices (oeffentlichevergabe.de, CC0). Matches the buyer name (case-insensitive substring, e.g. "Universitätsklinikum Halle", "Stadt Angermünde"). Returns process count, how many of those disclosed a EUR value (German notices below the EU publication threshold frequently omit contract value — this is reported, not hidden), total disclosed spend in EUR, top procurement categories, and a sample of recent processes. Spans up to 12+ months (see data_as_of in the response for the current coverage).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        buyer: { type: 'string', description: 'Buyer name, partial match, e.g. "Universitätsklinikum Halle", "Stadt Angermünde", "Ministerium".' },
+        date_from: { type: 'string', description: 'Earliest publish date, YYYY-MM-DD. Omit for no lower bound.' },
+        date_to: { type: 'string', description: 'Latest publish date, YYYY-MM-DD. Omit for no upper bound.' },
+        sample_limit: { type: ['number', 'string'], description: 'How many example processes to include (default 10, max 25).' },
+      },
+      required: ['buyer'],
+    },
+  },
+  {
+    name: 'germany_supplier_win_history',
+    description:
+      'Contract-win history for a GERMAN supplier/contractor (e.g. "Uniola AG", "System Strobel GmbH") across German OCDS tender notices (oeffentlichevergabe.de, CC0) — which buyers they won work from, award dates, and disclosed EUR values where published. COVERAGE IS GENUINELY PARTIAL: the winning supplier and award value are disclosed on only a small minority of German notices (below-threshold contracts routinely omit both) — the response reports won_count vs. value_disclosed_count so that gap is visible rather than read as "no data". See data_as_of in the response for the current coverage.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        supplier: { type: 'string', description: 'Supplier/company name, partial match, e.g. "Uniola AG", "System Strobel".' },
+        date_from: { type: 'string', description: 'Earliest publish date, YYYY-MM-DD. Omit for no lower bound.' },
+        date_to: { type: 'string', description: 'Latest publish date, YYYY-MM-DD. Omit for no upper bound.' },
+        sample_limit: { type: ['number', 'string'], description: 'How many example awards to include (default 10, max 25).' },
+      },
+      required: ['supplier'],
+    },
+  },
 ];
 
 async function callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
   try {
+    const cfg = supabaseConfig(args);
     switch (name) {
       case 'germany_search_tenders':
-        return await searchTenders(args);
+        return await searchTenders(args, cfg);
+      case 'germany_buyer_spend_history':
+        return await buyerSpendHistory(args, cfg);
+      case 'germany_supplier_win_history':
+        return await supplierWinHistory(args, cfg);
       default:
         return { error: `Unknown tool: ${name}` };
     }
@@ -838,106 +885,65 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
   }
 }
 
-async function searchTenders(args: Record<string, unknown>): Promise<unknown> {
-  const now = new Date();
-  // The upstream publishes ONE export per day and refuses the current one:
-  // `pubDay=<today>` is a 400, "The specified pubDay exceeds the allowed range.
-  // It must lie in the past." Since the default window ended at `now`, every
-  // default call spent its newest slot on a day that cannot succeed — and the
-  // failure landed in `fetch_errors` while the answer stayed `count: 0`, which
-  // reads as "Germany is not tendering anything" rather than "we asked for a
-  // day that does not exist yet". Verified live 2026-08-11: today 400,
-  // yesterday and the day before 200.
-  const latestAvailable = new Date(now.getTime() - 86400000);
-  const requestedTo = parseDate(strArg(args.date_to)) ?? latestAvailable;
-  const requestedFrom = parseDate(strArg(args.date_from)) ?? new Date(requestedTo.getTime() - DEFAULT_DAYS * 86400000);
+// --- Supabase store access --------------------------------------------------
 
-  // Check the caller's OWN dates first: inverted input is their mistake and
-  // should say so. Only then clamp to what the upstream actually publishes,
-  // otherwise clamping turns a perfectly reasonable "what came out today?" into
-  // an accusation that they put the dates the wrong way round.
-  if (requestedFrom.getTime() > requestedTo.getTime()) {
-    return { error: 'user_error: date_from must be on or before date_to.' };
-  }
-  const clampedTo = requestedTo.getTime() > latestAvailable.getTime();
-  const dateTo = clampedTo ? latestAvailable : requestedTo;
-  const dateFrom = requestedFrom.getTime() > dateTo.getTime() ? dateTo : requestedFrom;
-  if (clampedTo && requestedFrom.getTime() > latestAvailable.getTime()) {
-    // They asked only for day(s) that do not exist yet.
-    return {
-      found: false,
-      source: 'oeffentlichevergabe.de (Bekanntmachungsservice, OCDS, CC0)',
-      country: 'Germany',
-      reason: 'day_not_published_yet',
-      requested: { date_from: fmtDate(requestedFrom), date_to: fmtDate(requestedTo) },
-      latest_available: fmtDate(latestAvailable),
-      hint: `The upstream publishes one export per PAST day, so ${fmtDate(requestedFrom)} does not exist yet. The newest available day is ${fmtDate(latestAvailable)}; call again without dates to get the most recent notices.`,
-    };
-  }
-  const query = strArg(args.query)?.toLowerCase();
-  const limit = Math.min(Math.max(intArg(args.limit) ?? 25, 1), 100);
-
-  // Build the list of days to fetch, newest-first, capped at MAX_DAYS.
-  const days = enumerateDays(dateFrom, dateTo).reverse().slice(0, MAX_DAYS);
-  const fetchedDays: string[] = [];
-  const errors: string[] = [];
-  const tenders: ShapedTender[] = [];
-
-  for (const day of days) {
-    if (tenders.length >= limit) break;
-    let releases: OcdsRelease[];
-    try {
-      releases = await fetchDayReleases(day);
-      fetchedDays.push(day);
-    } catch (e) {
-      errors.push(`${day}: ${dropClassPrefix(e instanceof Error ? e.message : String(e))}`);
-      continue;
-    }
-    for (const rel of releases) {
-      const shaped = shapeRelease(rel);
-      if (!shaped) continue;
-      if (query && !matchesQuery(shaped, query)) continue;
-      tenders.push(shaped);
-    }
-  }
-
-  // Sort newest publish date first, then trim to limit.
-  tenders.sort((a, b) => (b.published ?? '').localeCompare(a.published ?? ''));
-  const trimmed = tenders.slice(0, limit).map(({ _description, ...rest }) => rest);
-
-  // Every requested day failed. That is not an empty result set — we never got
-  // to look — and returning `tenders: []` presents it as one. Say so instead,
-  // with the upstream's own words.
-  if (fetchedDays.length === 0 && errors.length > 0) {
-    return {
-      error: 'upstream_down: could not fetch any daily export from oeffentlichevergabe.de, so this is NOT a "no tenders found" answer — nothing was searched.',
-      source: 'oeffentlichevergabe.de (Bekanntmachungsservice, OCDS, CC0)',
-      country: 'Germany',
-      days_attempted: days,
-      fetch_errors: errors,
-      hint: 'Each day is a separate export and only past days exist. Retry with an explicit date_from/date_to ending yesterday or earlier.',
-    };
-  }
-
-  const truncatedRange = enumerateDays(dateFrom, dateTo).length > MAX_DAYS;
-  return {
-    source: 'oeffentlichevergabe.de (Bekanntmachungsservice, OCDS, CC0)',
-    country: 'Germany',
-    date_from: fmtDate(dateFrom),
-    date_to: fmtDate(dateTo),
-    days_fetched: fetchedDays,
-    ...(query ? { query: strArg(args.query) } : {}),
-    count: trimmed.length,
-    tenders: trimmed,
-    ...(truncatedRange
-      ? { note: `Only the most recent ${MAX_DAYS} day(s) of the requested range were fetched (per-call cap of 3 days). Narrow date_from/date_to to reach older notices.` }
-      : {}),
-    ...(clampedTo
-      ? { date_note: `Today's export does not exist yet — the upstream publishes one file per past day — so the window ends ${fmtDate(dateTo)}.` }
-      : {}),
-    ...(errors.length ? { fetch_errors: errors } : {}),
-  };
+interface SupabaseConfig {
+  url: string;
+  key: string;
 }
+
+function supabaseConfig(args: Record<string, unknown>): SupabaseConfig | null {
+  const url = (args._supabaseUrl as string | undefined)?.trim();
+  const key = (args._supabaseKey as string | undefined)?.trim();
+  return url && key ? { url, key } : null;
+}
+
+async function sbRpc<T>(cfg: SupabaseConfig, fn: string, body: Record<string, unknown>): Promise<T> {
+  const res = await pwFetch(`${cfg.url}/rest/v1/rpc/${fn}`, {
+    method: 'POST',
+    headers: {
+      apikey: cfg.key,
+      Authorization: `Bearer ${cfg.key}`,
+      'Content-Type': 'application/json',
+      Prefer: 'params=single-object',
+    },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`Germany procurement store: ${res.status} ${summarizeErrorBody(await res.text().catch(() => ''))}`.trim());
+  return res.json() as Promise<T>;
+}
+
+async function sbSelect<T>(cfg: SupabaseConfig, table: string, query: string): Promise<T> {
+  const res = await pwFetch(`${cfg.url}/rest/v1/${table}?${query}`, {
+    headers: { apikey: cfg.key, Authorization: `Bearer ${cfg.key}` },
+  });
+  if (!res.ok) throw new Error(`Germany procurement store: ${res.status} ${summarizeErrorBody(await res.text().catch(() => ''))}`.trim());
+  return res.json() as Promise<T>;
+}
+
+interface Coverage {
+  min_day: string | null;
+  max_day: string | null;
+  days_loaded: number;
+}
+
+// Cached per Worker isolate — coverage changes at most once a day (the loader
+// runs daily), so re-querying it on every call inside a warm isolate buys
+// nothing. A cold isolate re-fetches it once.
+let cachedCoverage: Coverage | null | undefined;
+
+async function getCoverage(cfg: SupabaseConfig): Promise<Coverage | null> {
+  if (cachedCoverage !== undefined) return cachedCoverage;
+  try {
+    const rows = await sbRpc<Coverage[]>(cfg, 'germany_coverage', {});
+    cachedCoverage = rows[0] ?? null;
+  } catch {
+    cachedCoverage = null; // freshness/coverage is metadata; never the reason a call fails
+  }
+  return cachedCoverage;
+}
+
+// --- germany_search_tenders --------------------------------------------------
 
 interface ShapedTender {
   ocid: string;
@@ -953,10 +959,183 @@ interface ShapedTender {
   status?: string;
   published?: string;
   deadline?: string;
-  _description?: string; // internal, for query matching only (stripped from output)
+  _description?: string; // internal, for live-path query matching only (stripped from output)
 }
 
-function shapeRelease(rel: OcdsRelease): ShapedTender | null {
+async function searchTenders(args: Record<string, unknown>, cfg: SupabaseConfig | null): Promise<unknown> {
+  const now = new Date();
+  // The upstream publishes ONE export per day and refuses the current one:
+  // `pubDay=<today>` is a 400, "The specified pubDay exceeds the allowed range.
+  // It must lie in the past." Since the default window ended at `now`, every
+  // default call spent its newest slot on a day that cannot succeed. Verified
+  // live 2026-08-11: today 400, yesterday and the day before 200.
+  const latestAvailable = new Date(now.getTime() - 86400000);
+  const requestedTo = parseDate(strArg(args.date_to)) ?? latestAvailable;
+  const requestedFrom = parseDate(strArg(args.date_from)) ?? new Date(requestedTo.getTime() - DEFAULT_DAYS * 86400000);
+
+  if (requestedFrom.getTime() > requestedTo.getTime()) {
+    return { error: 'user_error: date_from must be on or before date_to.' };
+  }
+  const clampedTo = requestedTo.getTime() > latestAvailable.getTime();
+  const dateTo = clampedTo ? latestAvailable : requestedTo;
+  const dateFrom = requestedFrom.getTime() > dateTo.getTime() ? dateTo : requestedFrom;
+  if (clampedTo && requestedFrom.getTime() > latestAvailable.getTime()) {
+    return {
+      found: false,
+      source: 'oeffentlichevergabe.de (Bekanntmachungsservice, OCDS, CC0)',
+      country: 'Germany',
+      reason: 'day_not_published_yet',
+      requested: { date_from: fmtDate(requestedFrom), date_to: fmtDate(requestedTo) },
+      latest_available: fmtDate(latestAvailable),
+      hint: `The upstream publishes one export per PAST day, so ${fmtDate(requestedFrom)} does not exist yet. The newest available day is ${fmtDate(latestAvailable)}; call again without dates to get the most recent notices.`,
+    };
+  }
+  const query = strArg(args.query)?.toLowerCase();
+  const limit = Math.min(Math.max(intArg(args.limit) ?? 25, 1), 100);
+
+  const coverage = cfg ? await getCoverage(cfg) : null;
+  const storeMinDay = coverage?.min_day ? parseDate(coverage.min_day) : null;
+  const storeMaxDay = coverage?.max_day ? parseDate(coverage.max_day) : null;
+
+  const tenders: ShapedTender[] = [];
+  const errors: string[] = [];
+  const freshlyRetrievedDays: string[] = [];
+  let precomputedCount = 0;
+
+  // Part 1: whatever of the requested range is already answerable ahead of
+  // this call.
+  const storeOverlapFrom = storeMinDay && storeMinDay.getTime() > dateFrom.getTime() ? storeMinDay : dateFrom;
+  const storeOverlapTo = storeMaxDay && storeMaxDay.getTime() < dateTo.getTime() ? storeMaxDay : dateTo;
+  const hasStoreOverlap = cfg && storeMinDay && storeMaxDay && storeOverlapFrom.getTime() <= storeOverlapTo.getTime();
+  if (hasStoreOverlap && cfg) {
+    try {
+      const rows = await storeSearch(cfg, storeOverlapFrom, storeOverlapTo, query, limit);
+      precomputedCount = rows.length;
+      for (const r of rows) tenders.push(r);
+    } catch (e) {
+      errors.push(`range_lookup: ${dropClassPrefix(e instanceof Error ? e.message : String(e))}`);
+    }
+  }
+
+  // Part 2: whatever of the requested range is not already answerable —
+  // fetched on demand, capped at MAX_LIVE_DAYS days total regardless of how
+  // the gap is shaped (before, after, or everything unconfigured).
+  const allDays = enumerateDays(dateFrom, dateTo);
+  const uncoveredDays = allDays.filter((d) => {
+    if (!hasStoreOverlap) return true;
+    const day = parseDate(d)!;
+    return day.getTime() < storeOverlapFrom.getTime() || day.getTime() > storeOverlapTo.getTime();
+  });
+  const liveDays = uncoveredDays.reverse().slice(0, MAX_LIVE_DAYS); // newest-first, capped
+  for (const day of liveDays) {
+    if (tenders.length >= limit) break;
+    try {
+      const releases = await fetchDayReleases(day);
+      freshlyRetrievedDays.push(day);
+      for (const rel of releases) {
+        const shaped = shapeLiveRelease(rel);
+        if (!shaped) continue;
+        if (query && !matchesQuery(shaped, query)) continue;
+        tenders.push(shaped);
+      }
+    } catch (e) {
+      errors.push(`${day}: ${dropClassPrefix(e instanceof Error ? e.message : String(e))}`);
+    }
+  }
+
+  tenders.sort((a, b) => (b.published ?? '').localeCompare(a.published ?? ''));
+  const trimmed = tenders.slice(0, limit).map(({ _description, ...rest }) => rest);
+
+  const noDataAtAll = precomputedCount === 0 && freshlyRetrievedDays.length === 0 && errors.length > 0;
+  if (noDataAtAll) {
+    return {
+      error: 'upstream_down: could not read any data for the requested range, so this is NOT a "no tenders found" answer — nothing was searched.',
+      source: 'oeffentlichevergabe.de (Bekanntmachungsservice, OCDS, CC0)',
+      country: 'Germany',
+      fetch_errors: errors,
+      hint: 'Retry with an explicit date_from/date_to ending yesterday or earlier.',
+    };
+  }
+
+  const truncatedRange = uncoveredDays.length > MAX_LIVE_DAYS;
+  return {
+    source: 'oeffentlichevergabe.de (Bekanntmachungsservice, OCDS, CC0)',
+    country: 'Germany',
+    date_from: fmtDate(dateFrom),
+    date_to: fmtDate(dateTo),
+    data_as_of: coverage?.max_day ?? (freshlyRetrievedDays[0] ?? null),
+    ...(query ? { query: strArg(args.query) } : {}),
+    count: trimmed.length,
+    tenders: trimmed,
+    ...(truncatedRange
+      ? { note: `${uncoveredDays.length - liveDays.length} day(s) of the requested range are not included in this response (per-call limit of ${MAX_LIVE_DAYS} day(s)). Narrow date_from/date_to, or try again shortly, to reach them.` }
+      : {}),
+    ...(clampedTo
+      ? { date_note: `Today's export does not exist yet — the upstream publishes one file per past day — so the window ends ${fmtDate(dateTo)}.` }
+      : {}),
+    ...(errors.length ? { fetch_errors: errors } : {}),
+  };
+}
+
+interface StoreRow {
+  ocid: string;
+  title: string | null;
+  description: string | null;
+  buyer: string | null;
+  buyer_location: string | null;
+  status: string | null;
+  category: string | null;
+  cpv: string | null;
+  cpv_description: string | null;
+  procurement_method: string | null;
+  value_amount: number | null;
+  value_currency: string | null;
+  tender_deadline: string | null;
+  release_date: string | null;
+}
+
+const STORE_SELECT =
+  'select=ocid,title,description,buyer,buyer_location,status,category,cpv,cpv_description,procurement_method,value_amount,value_currency,tender_deadline,release_date';
+
+async function storeSearch(cfg: SupabaseConfig, from: Date, to: Date, query: string | undefined, limit: number): Promise<ShapedTender[]> {
+  const parts = [
+    `source_id=eq.${encodeURIComponent(SOURCE_ID)}`,
+    `release_date=gte.${new Date(Date.UTC(from.getUTCFullYear(), from.getUTCMonth(), from.getUTCDate())).toISOString()}`,
+    `release_date=lte.${new Date(Date.UTC(to.getUTCFullYear(), to.getUTCMonth(), to.getUTCDate(), 23, 59, 59)).toISOString()}`,
+  ];
+  if (query) {
+    // Same characters PostgREST parses structurally inside or=(...) are
+    // stripped before encoding (mirrors mcps/open-contracting's approach).
+    const safe = query.replace(/[(),"\\]/g, '');
+    parts.push(`or=(title.ilike.*${encodeURIComponent(safe)}*,description.ilike.*${encodeURIComponent(safe)}*,buyer.ilike.*${encodeURIComponent(safe)}*,cpv_description.ilike.*${encodeURIComponent(safe)}*)`);
+  }
+  parts.push(STORE_SELECT, 'order=release_date.desc.nullslast', `limit=${Math.min(limit, 100)}`);
+  const rows = await sbSelect<StoreRow[]>(cfg, 'ocds_releases', parts.join('&'));
+  return rows.map(shapeStoreRow);
+}
+
+function shapeStoreRow(r: StoreRow): ShapedTender {
+  const shaped: ShapedTender = { ocid: r.ocid };
+  const set = <K extends keyof ShapedTender>(k: K, v: ShapedTender[K]): void => {
+    if (v !== undefined && v !== null && (v as unknown) !== '') shaped[k] = v;
+  };
+  set('title', r.title ?? undefined);
+  set('buyer', r.buyer ?? undefined);
+  set('buyer_location', r.buyer_location ?? undefined);
+  set('value_eur', r.value_currency === 'EUR' ? (r.value_amount ?? undefined) : undefined);
+  set('currency', r.value_currency ?? undefined);
+  set('category', r.category ?? undefined);
+  set('cpv', r.cpv ?? undefined);
+  set('cpv_description', r.cpv_description ?? undefined);
+  set('procurement_method', r.procurement_method ?? undefined);
+  set('status', r.status ?? undefined);
+  set('published', r.release_date ?? undefined);
+  set('deadline', r.tender_deadline ?? undefined);
+  set('_description', r.description ?? undefined);
+  return shaped;
+}
+
+function shapeLiveRelease(rel: OcdsRelease): ShapedTender | null {
   if (!rel?.ocid) return null;
   const t = rel.tender ?? {};
   const buyer = rel.buyer ?? t.procuringEntity ?? {};
@@ -965,7 +1144,6 @@ function shapeRelease(rel: OcdsRelease): ShapedTender | null {
   const buyerLocation = buyer.address
     ? [buyer.address.locality, buyer.address.countryName].filter(Boolean).join(', ') || undefined
     : undefined;
-  // Build with only the fields that are present, for a clean payload.
   const shaped: ShapedTender = { ocid: rel.ocid };
   const set = <K extends keyof ShapedTender>(k: K, v: ShapedTender[K]): void => {
     if (v !== undefined && v !== null && (v as unknown) !== '') shaped[k] = v;
@@ -982,7 +1160,6 @@ function shapeRelease(rel: OcdsRelease): ShapedTender | null {
   set('status', t.status);
   set('published', rel.date);
   set('deadline', t.tenderPeriod?.endDate);
-  // _description is kept only for query matching; stripped before output.
   set('_description', t.description);
   return shaped;
 }
@@ -1009,13 +1186,131 @@ function firstCpv(t: OcdsTender): OcdsClassification | undefined {
   return undefined;
 }
 
-// --- Fetch + unzip a single day's OCDS export ------------------------------
+// --- germany_buyer_spend_history / germany_supplier_win_history -----------
+
+interface BuyerSpendRow {
+  process_count: number;
+  value_disclosed_count: number;
+  total_value_eur: number | null;
+  award_disclosed_count: number;
+  total_award_value_eur: number | null;
+  earliest_release: string | null;
+  latest_release: string | null;
+  top_categories: { category: string; count: number }[];
+  sample_processes: Record<string, unknown>[];
+}
+
+async function buyerSpendHistory(args: Record<string, unknown>, cfg: SupabaseConfig | null): Promise<unknown> {
+  if (!cfg) return notConfigured();
+  const buyer = strArg(args.buyer);
+  if (!buyer) return { error: 'missing_args: provide a buyer name (partial match).' };
+  const dateFrom = parseDate(strArg(args.date_from));
+  const dateTo = parseDate(strArg(args.date_to));
+  const sampleLimit = Math.min(Math.max(intArg(args.sample_limit) ?? 10, 0), 25);
+
+  const coverage = await getCoverage(cfg);
+  const rows = await sbRpc<BuyerSpendRow[]>(cfg, 'germany_buyer_spend_history', {
+    p_buyer: buyer,
+    p_date_from: dateFrom ? dateFrom.toISOString() : null,
+    p_date_to: dateTo ? dateTo.toISOString() : null,
+    p_sample_limit: sampleLimit,
+  });
+  const r = rows[0];
+  if (!r || r.process_count === 0) {
+    return {
+      found: false,
+      buyer,
+      country: 'Germany',
+      data_as_of: coverage?.max_day ?? null,
+      hint: `No buyer matching "${buyer}"${coverage?.min_day ? ` in the ${coverage.min_day} to ${coverage.max_day} coverage window` : ''}. Try a shorter fragment of the name, or call germany_search_tenders to see how buyer names are spelled.`,
+    };
+  }
+  return {
+    source: 'oeffentlichevergabe.de (Bekanntmachungsservice, OCDS, CC0)',
+    country: 'Germany',
+    buyer_query: buyer,
+    data_as_of: coverage?.max_day ?? null,
+    coverage_range: coverage?.min_day ? { from: coverage.min_day, to: coverage.max_day } : null,
+    process_count: r.process_count,
+    value_disclosed_count: r.value_disclosed_count,
+    total_value_eur: r.total_value_eur,
+    award_disclosed_count: r.award_disclosed_count,
+    total_award_value_eur: r.total_award_value_eur,
+    earliest_release: r.earliest_release,
+    latest_release: r.latest_release,
+    top_categories: r.top_categories,
+    sample_processes: r.sample_processes,
+    coverage_note: 'German notices below the EU publication threshold frequently omit contract value — value_disclosed_count / process_count is the real coverage, not an error.',
+  };
+}
+
+interface SupplierWinRow {
+  won_count: number;
+  value_disclosed_count: number;
+  total_award_value_eur: number | null;
+  distinct_buyers: number;
+  earliest_award: string | null;
+  latest_award: string | null;
+  top_buyers: { buyer: string; count: number }[];
+  sample_awards: Record<string, unknown>[];
+}
+
+async function supplierWinHistory(args: Record<string, unknown>, cfg: SupabaseConfig | null): Promise<unknown> {
+  if (!cfg) return notConfigured();
+  const supplier = strArg(args.supplier);
+  if (!supplier) return { error: 'missing_args: provide a supplier name (partial match).' };
+  const dateFrom = parseDate(strArg(args.date_from));
+  const dateTo = parseDate(strArg(args.date_to));
+  const sampleLimit = Math.min(Math.max(intArg(args.sample_limit) ?? 10, 0), 25);
+
+  const coverage = await getCoverage(cfg);
+  const rows = await sbRpc<SupplierWinRow[]>(cfg, 'germany_supplier_win_history', {
+    p_supplier: supplier,
+    p_date_from: dateFrom ? dateFrom.toISOString() : null,
+    p_date_to: dateTo ? dateTo.toISOString() : null,
+    p_sample_limit: sampleLimit,
+  });
+  const r = rows[0];
+  if (!r || r.won_count === 0) {
+    return {
+      found: false,
+      supplier,
+      country: 'Germany',
+      data_as_of: coverage?.max_day ?? null,
+      hint: `No supplier matching "${supplier}" with a disclosed award${coverage?.min_day ? ` in the ${coverage.min_day} to ${coverage.max_day} coverage window` : ''}. Winning-supplier names are disclosed on only a minority of German notices, so a real supplier can still return no rows — try germany_search_tenders for the company's tenders in general.`,
+    };
+  }
+  return {
+    source: 'oeffentlichevergabe.de (Bekanntmachungsservice, OCDS, CC0)',
+    country: 'Germany',
+    supplier_query: supplier,
+    data_as_of: coverage?.max_day ?? null,
+    coverage_range: coverage?.min_day ? { from: coverage.min_day, to: coverage.max_day } : null,
+    won_count: r.won_count,
+    value_disclosed_count: r.value_disclosed_count,
+    total_award_value_eur: r.total_award_value_eur,
+    distinct_buyers: r.distinct_buyers,
+    earliest_award: r.earliest_award,
+    latest_award: r.latest_award,
+    top_buyers: r.top_buyers,
+    sample_awards: r.sample_awards,
+    coverage_note: 'Winning-supplier identity and award value are disclosed on only a minority of German notices (below-threshold contracts routinely omit both) — won_count / value_disclosed_count is the real coverage, not an error.',
+  };
+}
+
+function notConfigured() {
+  return {
+    error: 'not_configured: this tool is not enabled on this deployment — an operator must turn it on. This is a setup problem, not your arguments. germany_search_tenders is unaffected.',
+  };
+}
+
+// --- Fetch + unzip a single day's OCDS export (live path) ------------------
 
 async function fetchDayReleases(day: string): Promise<OcdsRelease[]> {
   const url = `${BASE}/api/notice-exports?pubDay=${encodeURIComponent(day)}&format=ocds.zip`;
   const res = await pwFetch(url, { headers: { Accept: '*/*', 'User-Agent': UA } });
   if (!res.ok) {
-    const body = await res.text().then((b) => b.slice(0, 200)).catch(() => '');
+    const body = summarizeErrorBody(await res.text().catch(() => ''));
     throw new Error(`notice-exports ${res.status} ${body}`.trim());
   }
   const bytes = new Uint8Array(await res.arrayBuffer());

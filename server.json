@@ -3,7 +3,7 @@
   "name": "io.github.pipeworx-io/germany-tenders",
   "title": "Germany Tenders",
   "description": "Germany public procurement MCP — official German government tenders (keyless).",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "websiteUrl": "https://pipeworx.io/packs/germany-tenders",
   "repository": {
     "url": "https://github.com/pipeworx-io/mcp-germany-tenders",

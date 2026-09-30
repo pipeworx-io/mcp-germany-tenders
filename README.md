@@ -2,13 +2,15 @@
 
 Germany public procurement MCP — official German government tenders (keyless).
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1683+ live data sources.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1686+ live data sources.
 
 ## Tools
 
 | Tool | Description |
 |------|-------------|
-| `germany_search_tenders` | Search official GERMAN government public-procurement tenders (Öffentliche Vergabe / Ausschreibungen) from the federal Bekanntmachungsservice open-data feed (oeffentlichevergabe.de), Open Contracting Data Standard (OCDS). Returns each notice shaped: ocid, title, buyer/Vergabestelle, contract value in EUR, procurement category, CPV code, procurement method, submission deadline, and publish date. Filter by publish-date range and/or a keyword (matched against title, description, buyer, and CPV description — German text). Defaults to the most recent days if no dates given. Data covers Germany only. |
+| `germany_search_tenders` | Search official GERMAN government public-procurement tenders (Öffentliche Vergabe / Ausschreibungen) from the federal Bekanntmachungsservice open-data feed (oeffentlichevergabe.de), Open Contracting Data Standard (OCDS, CC0). Returns each notice shaped: ocid, title, buyer/Vergabestelle, contract value in EUR, procurement category, CPV code, procurement method, submission deadline, and publish date. Filter by publish-date range and/or a keyword (matched against title, description, buyer, and CPV description — German text). Defaults to the most recent days if no dates given. Can answer wide date ranges (months) as well as very recent days. Data covers Germany only. |
+| `germany_buyer_spend_history` | Procurement spend history for a GERMAN government buyer (Vergabestelle) — e.g. a city, a ministry, a university hospital — across German OCDS tender notices (oeffentlichevergabe.de, CC0). Matches the buyer name (case-insensitive substring, e.g. "Universitätsklinikum Halle", "Stadt Angermünde"). Returns process count, how many of those disclosed a EUR value (German notices below the EU publication threshold frequently omit contract value — this is reported, not hidden), total disclosed spend in EUR, top procurement categories, and a sample of recent processes. Spans up to 12+ months (see data_as_of in the response for the current coverage). |
+| `germany_supplier_win_history` | Contract-win history for a GERMAN supplier/contractor (e.g. "Uniola AG", "System Strobel GmbH") across German OCDS tender notices (oeffentlichevergabe.de, CC0) — which buyers they won work from, award dates, and disclosed EUR values where published. COVERAGE IS GENUINELY PARTIAL: the winning supplier and award value are disclosed on only a small minority of German notices (below-threshold contracts routinely omit both) — the response reports won_count vs. value_disclosed_count so that gap is visible rather than read as "no data". See data_as_of in the response for the current coverage. |
 
 ## Quick Start
 
@@ -54,7 +56,7 @@ directly, instead of just this one's:
 }
 ```
 
-Both URLs reach the same gateway and the same 1683+ data sources. The
+Both URLs reach the same gateway and the same 1686+ data sources. The
 only difference is which pack's tools are listed **directly**; `ask_pipeworx`
 reaches all of them from either one.
 
