@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-germany-tenders",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Germany public procurement MCP — official German government tenders (keyless).",
   "type": "module",
   "main": "lib/index.js",
@@ -27,7 +27,7 @@
     "mode": "gateway",
     "slug": "germany-tenders",
     "gatewaySlug": "germany-tenders",
-    "sourceHash": "v1-0f716bbfbf044e86fd7f5b466235516319fd5445ff65d52442fa6b4744a1fd97",
-    "sourceCommit": "bb047243cf27f32453103de186b8e6a8b6a1ce79"
+    "sourceHash": "v1-a7405e7109553bb95e1649c2b68024fd15119473ac85bbc2dead7d6484d62390",
+    "sourceCommit": "030233f6b150a38a44421f88a5fcbad123f0fea8"
   }
 }
